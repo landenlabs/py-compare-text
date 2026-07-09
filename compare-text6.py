@@ -9,10 +9,14 @@ Features:
   • LCS-based auto-alignment (ignores whitespace & non-alphanumeric chars)
   • Manual shift (↑/↓) for left or right panel independently
   • Multi-select rows: Ctrl+click toggle, Shift+click range
-  • Right-click: delete block (selected blank rows), insert N blanks for N selected rows
+  • Right-click: delete row(s) — blank or real content, single or block; deleting a
+    content row is permanent (removed from the underlying source, so Save/Reset/
+    Auto-Align no longer see it)
+  • Right-click: insert N blanks for N selected rows
   • Right-click (cross-panel): Compare — word-level diff highlight on two selected rows
   • Right-click (cross-panel): Sync — insert blanks so both selected rows align vertically
   • Toolbar +/- blank row buttons act on the selected row
+  • Undo (Ctrl+Z) per panel — reverses row deletes/inserts on that side
   • Synchronized vertical scrolling
   • Color-coded rows: green=match, yellow=different, red=left-only, blue=right-only
   • Jump to next/previous difference
@@ -44,19 +48,20 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, QRect, QPoint, QSettings
 from PyQt6.QtGui import (
-    QAction, QColor, QFont, QFontMetrics, QImageReader, QKeySequence,
+    QAction, QColor, QFont, QFontMetrics, QIcon, QImageReader, QKeySequence,
     QMovie, QPainter, QPixmap,
 )
+
+from version import __version__
 
 
 # ── Application metadata (shown in Settings ▸ About) ───────────────────────────
 
 APP_NAME    = "CompareTool"
 APP_ORG     = "compare-tool"
-VERSION     = "6.0"
 AUTHOR      = "Dennis Lang"
 GITHUB_URL  = "https://github.com/landenlabs/compare-tool"
-LICENSE     = "MIT"
+LICENSE     = "Apache 2.0"
 ATTRIBUTION = "Built with PyQt6.  Alignment uses Python's difflib (LCS)."
 
 
@@ -72,35 +77,59 @@ FONT_BOLD_DEFAULT   = True
 
 ZOOM_LEVELS = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200]
 
+UNDO_LIMIT_MB_DEFAULT = 5   # panels larger than this stop recording undo history; 0 = no limit
+
 
 # ── Appearance settings (persisted via QSettings) ──────────────────────────────
 
 @dataclass
 class Appearance:
     """User-tunable viewer appearance; persisted across runs."""
-    font_family: str  = FONT_FAMILY_DEFAULT
-    font_bold:   bool = FONT_BOLD_DEFAULT
-    font_size:   int  = BASE_FONT_SIZE   # base point size at 100% zoom
-    row_height:  int  = BASE_ROW_H       # base row pixels at 100% zoom
+    font_family:   str  = FONT_FAMILY_DEFAULT
+    font_bold:     bool = FONT_BOLD_DEFAULT
+    font_size:     int  = BASE_FONT_SIZE   # base point size at 100% zoom
+    row_height:    int  = BASE_ROW_H       # base row pixels at 100% zoom
+    undo_limit_mb: int  = UNDO_LIMIT_MB_DEFAULT  # 0 disables the limit (always track undo)
 
 
 def load_appearance() -> Appearance:
     s = QSettings(APP_ORG, APP_NAME)
     d = Appearance()
     return Appearance(
-        font_family=s.value("appearance/font_family", d.font_family, type=str),
-        font_bold=  s.value("appearance/font_bold",   d.font_bold,   type=bool),
-        font_size=  s.value("appearance/font_size",   d.font_size,   type=int),
-        row_height= s.value("appearance/row_height",  d.row_height,  type=int),
+        font_family=  s.value("appearance/font_family",   d.font_family,   type=str),
+        font_bold=    s.value("appearance/font_bold",      d.font_bold,     type=bool),
+        font_size=    s.value("appearance/font_size",      d.font_size,     type=int),
+        row_height=   s.value("appearance/row_height",     d.row_height,    type=int),
+        undo_limit_mb=s.value("appearance/undo_limit_mb",  d.undo_limit_mb, type=int),
     )
+
+
+@dataclass
+class RowEdit:
+    """One row's worth of undo information for a delete operation.
+
+    row      — index in the panel's rows list the value was removed from
+    value    — the removed value (a line of text, or None for a blank row)
+    src_idx  — index in the panel's source list the value was removed from,
+               or None if the row was blank (blanks never live in source)
+    """
+    row: int
+    value: str | None
+    src_idx: int | None
 
 
 def save_appearance(a: Appearance) -> None:
     s = QSettings(APP_ORG, APP_NAME)
-    s.setValue("appearance/font_family", a.font_family)
-    s.setValue("appearance/font_bold",   a.font_bold)
-    s.setValue("appearance/font_size",   a.font_size)
-    s.setValue("appearance/row_height",  a.row_height)
+    s.setValue("appearance/font_family",   a.font_family)
+    s.setValue("appearance/font_bold",     a.font_bold)
+    s.setValue("appearance/font_size",     a.font_size)
+    s.setValue("appearance/row_height",    a.row_height)
+    s.setValue("appearance/undo_limit_mb", a.undo_limit_mb)
+
+
+def line_bytes(line: str) -> int:
+    """Approximate on-disk size of one line, including its newline."""
+    return len(line.encode('utf-8')) + 1
 
 # Background colours per status
 BG: dict[str, QColor] = {
@@ -253,6 +282,7 @@ class PanelWidget(QWidget):
 
     rowClicked           = pyqtSignal(int)
     contextMenuRequested = pyqtSignal(int, QPoint)
+    focusGained          = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -440,6 +470,18 @@ class PanelWidget(QWidget):
         r = self._row_at(event.pos())
         if r < 0:
             return
+        if event.button() == Qt.MouseButton.RightButton:
+            # Right-click on a row that's already part of the selection must
+            # not collapse a multi-row selection — only replace it if the
+            # click landed outside the current selection (mirrors how most
+            # apps treat right-click-within-selection for context menus).
+            if r not in self.selected_rows:
+                self.selected_rows = {r}
+                self.selected = r
+                self.rowClicked.emit(r)
+                self.update()
+            self.setFocus()
+            return
         mods = event.modifiers()
         if mods & Qt.KeyboardModifier.ControlModifier:
             if r in self.selected_rows:
@@ -459,6 +501,10 @@ class PanelWidget(QWidget):
         self.rowClicked.emit(r)
         self.setFocus()
         self.update()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.focusGained.emit()
 
     def keyPressEvent(self, event):
         key  = event.key()
@@ -494,11 +540,8 @@ class PanelWidget(QWidget):
         r = self._row_at(event.pos())
         if r < 0:
             return
-        if r not in self.selected_rows:
-            self.selected_rows = {r}
-            self.selected = r
-            self.rowClicked.emit(r)
-            self.update()
+        # Selection is already settled by mousePressEvent (right-click there
+        # preserves an existing multi-row selection instead of collapsing it).
         self.contextMenuRequested.emit(r, event.globalPos())
 
 
@@ -599,12 +642,26 @@ _ANIM_MAX_W = _ABOUT_DIALOG_WIDTH - 32
 
 
 def _build_date() -> str:
+    """Release/build date, derived from version.py's mtime -- set-version.bash
+    rewrites version.py on every release, so this tracks the last publish."""
+    target = Path(__file__).parent / "version.py"
     try:
-        return datetime.fromtimestamp(
-            os.path.getmtime(Path(__file__))
-        ).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(target.stat().st_mtime).strftime("%Y-%m-%d")
     except OSError:
         return "unknown"
+
+
+def resource_path(name: str) -> Path:
+    """Locate a bundled resource (e.g. icon.png) both when run from source
+    and when frozen by PyInstaller, which unpacks --add-data into _MEIPASS."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / name
+
+
+def app_icon() -> QIcon:
+    """QIcon for icon.png, or a null QIcon if the resource is missing."""
+    path = resource_path("icon.png")
+    return QIcon(str(path)) if path.is_file() else QIcon()
 
 
 def _bold_label(text: str) -> QLabel:
@@ -616,7 +673,7 @@ def _bold_label(text: str) -> QLabel:
 
 
 def _animation_path() -> Path:
-    return Path(__file__).parent / "screens" / "landenlabs_400.webp"
+    return resource_path("screens/landenlabs_400.webp")
 
 
 def _animation_display_size(path: Path) -> QSize:
@@ -691,15 +748,27 @@ class SettingsDialog(QDialog):
         self._row_spin.setSuffix(" px")
         self._row_spin.setValue(a.row_height)
 
+        self._undo_limit_spin = QSpinBox()
+        self._undo_limit_spin.setRange(0, 9999)
+        self._undo_limit_spin.setSuffix(" MB")
+        self._undo_limit_spin.setSpecialValueText("No limit")
+        self._undo_limit_spin.setValue(a.undo_limit_mb)
+        self._undo_limit_spin.setToolTip(
+            "Once a panel's text exceeds this size, row delete/insert stops\n"
+            "being recorded for undo (Ctrl+Z) on that panel. 0 = no limit."
+        )
+
         form.addRow("Font family:", self._family_combo)
         form.addRow("",            self._bold_cb)
         form.addRow("Font size:",  self._size_spin)
         form.addRow("Row height:", self._row_spin)
+        form.addRow("Undo limit:", self._undo_limit_spin)
 
         self._family_combo.currentFontChanged.connect(self._on_changed)
         self._bold_cb.toggled.connect(self._on_changed)
         self._size_spin.valueChanged.connect(self._on_changed)
         self._row_spin.valueChanged.connect(self._on_changed)
+        self._undo_limit_spin.valueChanged.connect(self._on_changed)
         return w
 
     def _build_about_tab(self) -> QWidget:
@@ -721,15 +790,22 @@ class SettingsDialog(QDialog):
             self._movie.frameChanged.connect(self._on_anim_frame_changed)
             root.addWidget(self._anim_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        header = QHBoxLayout()
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(app_icon().pixmap(48, 48))
+        header.addWidget(icon_lbl)
+
         name_font = QFont()
         name_font.setPointSize(15)
         name_font.setBold(True)
         name_lbl = QLabel("Compare Tool")
         name_lbl.setFont(name_font)
-        root.addWidget(name_lbl)
+        header.addWidget(name_lbl)
+        header.addStretch(1)
+        root.addLayout(header)
 
         desc = QLabel(
-            f"v{VERSION}  —  Side-by-side text comparison with LCS alignment."
+            f"v{__version__}  —  Side-by-side text comparison with LCS alignment."
         )
         desc.setWordWrap(True)
         root.addWidget(desc)
@@ -794,6 +870,7 @@ class SettingsDialog(QDialog):
         self._bold_cb.setChecked(d.font_bold)
         self._size_spin.setValue(d.font_size)
         self._row_spin.setValue(d.row_height)
+        self._undo_limit_spin.setValue(d.undo_limit_mb)
         self._on_changed()
 
     def current_appearance(self) -> Appearance:
@@ -802,6 +879,7 @@ class SettingsDialog(QDialog):
             font_bold=self._bold_cb.isChecked(),
             font_size=self._size_spin.value(),
             row_height=self._row_spin.value(),
+            undo_limit_mb=self._undo_limit_spin.value(),
         )
 
 
@@ -813,14 +891,20 @@ class CompareWindow(QMainWindow):
                  sort: bool = False):
         super().__init__()
         self.setWindowTitle("Side-by-Side Comparison")
+        self.setWindowIcon(app_icon())
         self.resize(1400, 900)
 
         self._left_source:  list[str] = []
         self._right_source: list[str] = []
         self._left_rows:  list = []
         self._right_rows: list = []
+        self._paths: dict[str, str] = {'left': '', 'right': ''}
+        self._active_side = 'left'   # which panel Ctrl+Z should undo; tracks focus
         self._zoom_idx = ZOOM_LEVELS.index(100)
         self._appearance = load_appearance()
+        self._undo_stack: dict[str, list[dict]] = {'left': [], 'right': []}
+        self._source_bytes:   dict[str, int]  = {'left': 0,     'right': 0}
+        self._undo_disabled:  dict[str, bool] = {'left': False, 'right': False}
 
         self._build_ui()
         self._build_toolbar()
@@ -887,6 +971,8 @@ class CompareWindow(QMainWindow):
             lambda r, pos: self._on_context_menu('left', r, pos))
         self._right_panel.contextMenuRequested.connect(
             lambda r, pos: self._on_context_menu('right', r, pos))
+        self._left_panel.focusGained.connect(lambda: self._set_active_side('left'))
+        self._right_panel.focusGained.connect(lambda: self._set_active_side('right'))
 
         bottom = QWidget()
         bottom.setFixedHeight(26)
@@ -1051,6 +1137,14 @@ class CompareWindow(QMainWindow):
             sc.triggered.connect(lambda _checked=False, s=side: self._browse(s))
             self.addAction(sc)
 
+        # Window-level shortcut (not a PanelWidget keyPressEvent) so it fires
+        # reliably no matter which child widget currently has focus; it acts
+        # on whichever panel was most recently focused (see focusGained).
+        undo_sc = QAction(self)
+        undo_sc.setShortcut(QKeySequence.StandardKey.Undo)
+        undo_sc.triggered.connect(lambda: self._undo(self._active_side))
+        self.addAction(undo_sc)
+
         act("Auto-Align", "Align panels using LCS  (Ctrl+A)",    self._auto_align, "Ctrl+A")
         act("Sort",       "Sort both panels' lines  (Ctrl+S)",    self._sort_panels, "Ctrl+S")
         act("Reset",      "Remove all blank padding rows",        self._reset)
@@ -1098,20 +1192,21 @@ class CompareWindow(QMainWindow):
             self._save(side)
 
     def _save(self, side: str):
-        lines = self._left_source if side == 'left' else self._right_source
-        if not lines:
+        rows = self._left_rows if side == 'left' else self._right_rows
+        if not rows:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, f"Save {side.capitalize()} As", "", "All Files (*)"
+            self, f"Save {side.capitalize()} As", self._paths[side], "All Files (*)"
         )
         if not path:
             return
         try:
             with open(path, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(lines) + '\n')
+                f.write('\n'.join(r if r is not None else '' for r in rows) + '\n')
         except OSError as e:
             QMessageBox.critical(self, "Error", str(e))
             return
+        self._paths[side] = path
         title = self._left_title if side == 'left' else self._right_title
         title.set_file(os.path.basename(path), path)
 
@@ -1146,7 +1241,20 @@ class CompareWindow(QMainWindow):
             self._right_source = lines
             self._right_rows   = list(lines)
             self._right_title.set_file(name, path)
+        self._paths[side] = path
+        self._undo_stack[side] = []
+        self._source_bytes[side] = sum(line_bytes(l) for l in lines)
+        self._update_undo_gate(side)
         self._refresh()
+
+    def _update_undo_gate(self, side: str):
+        """Recompute whether undo tracking is disabled for `side` based on its
+        current source size vs. the configured limit (0 = no limit)."""
+        limit_mb = self._appearance.undo_limit_mb
+        if limit_mb <= 0:
+            self._undo_disabled[side] = False
+        else:
+            self._undo_disabled[side] = self._source_bytes[side] > limit_mb * 1024 * 1024
 
     # ── Alignment ─────────────────────────────────────────────────────────────
 
@@ -1157,6 +1265,7 @@ class CompareWindow(QMainWindow):
         self._left_rows, self._right_rows = lcs_align(
             self._left_source, self._right_source, lk, rk
         )
+        self._undo_stack = {'left': [], 'right': []}
         self._refresh()
 
     def _sort_panels(self):
@@ -1178,11 +1287,13 @@ class CompareWindow(QMainWindow):
 
         self._left_rows  = list(self._left_source)
         self._right_rows = list(self._right_source)
+        self._undo_stack = {'left': [], 'right': []}
         self._refresh()
 
     def _reset(self):
         self._left_rows  = list(self._left_source)
         self._right_rows = list(self._right_source)
+        self._undo_stack = {'left': [], 'right': []}
         self._refresh()
 
     # ── Manual adjustments ────────────────────────────────────────────────────
@@ -1203,78 +1314,148 @@ class CompareWindow(QMainWindow):
     def _insert_blank(self, side: str, row: int):
         rows = self._left_rows if side == 'left' else self._right_rows
         rows.insert(row, None)
-        self._refresh()
-
-    def _delete_blank(self, side: str, row: int):
-        rows = self._left_rows if side == 'left' else self._right_rows
-        if 0 <= row < len(rows) and rows[row] is None:
-            rows.pop(row)
+        if not self._undo_disabled[side]:
+            self._undo_stack[side].append({'type': 'remove', 'rows': [row]})
         self._refresh()
 
     def _insert_blank_at_sel(self, side: str):
         panel = self._left_panel if side == 'left' else self._right_panel
         r = panel.selected if panel.selected >= 0 else 0
         self._insert_blank(side, r)
+        # Re-select the same row index (now the freshly inserted blank) so the
+        # toolbar button can be clicked repeatedly without reselecting.
+        self._reselect_row(side, r)
 
     def _delete_blank_at_sel(self, side: str):
         panel = self._left_panel if side == 'left' else self._right_panel
-        if panel.selected >= 0:
-            self._delete_blank(side, panel.selected)
+        if panel.selected < 0:
+            return
+        rows = self._left_rows if side == 'left' else self._right_rows
+        row = panel.selected
+        if 0 <= row < len(rows) and rows[row] is None:
+            self._delete_rows(side, [row])
+            # Re-select the same row index (whatever shifted up into its
+            # place) so repeated clicks keep removing blanks in sequence.
+            self._reselect_row(side, row)
+
+    def _reselect_row(self, side: str, row: int):
+        panel = self._left_panel if side == 'left' else self._right_panel
+        if not panel.rows:
+            return
+        row = max(0, min(row, len(panel.rows) - 1))
+        panel.selected = row
+        panel.selected_rows = {row}
+        panel.update()
 
     def _insert_n_blanks(self, side: str, at_row: int, n: int):
+        if n <= 0:
+            return
         rows = self._left_rows if side == 'left' else self._right_rows
         for _ in range(n):
             rows.insert(at_row, None)
+        if not self._undo_disabled[side]:
+            self._undo_stack[side].append(
+                {'type': 'remove', 'rows': list(range(at_row, at_row + n))})
         self._refresh()
 
-    def _delete_selected_blanks(self, side: str):
-        panel = self._left_panel  if side == 'left' else self._right_panel
-        rows  = self._left_rows   if side == 'left' else self._right_rows
-        to_delete = sorted(
-            [r for r in panel.selected_rows
-             if 0 <= r < len(rows) and rows[r] is None],
-            reverse=True,
-        )
-        for r in to_delete:
+    def _apply_deletes(self, side: str, indices: list[int]) -> list[RowEdit]:
+        """Remove the given row indices (any mix of blank/content). Content rows
+        are also removed from the source list so the deletion is permanent —
+        it survives Reset/Auto-Align and is excluded from Save As. Returns the
+        removed values as RowEdit entries, in the order they were removed
+        (descending row index), for use by undo."""
+        rows   = self._left_rows   if side == 'left' else self._right_rows
+        source = self._left_source if side == 'left' else self._right_source
+        edits: list[RowEdit] = []
+        for r in sorted(set(indices), reverse=True):
+            if not (0 <= r < len(rows)):
+                continue
+            value = rows[r]
+            src_idx = None
+            if value is not None:
+                src_idx = sum(1 for x in rows[:r] if x is not None)
+                if 0 <= src_idx < len(source):
+                    source.pop(src_idx)
+                    self._source_bytes[side] -= line_bytes(value)
             rows.pop(r)
+            edits.append(RowEdit(r, value, src_idx))
+        if edits:
+            self._update_undo_gate(side)
+        return edits
+
+    def _delete_rows(self, side: str, indices: list[int]):
+        tracking = not self._undo_disabled[side]
+        edits = self._apply_deletes(side, indices)
+        if edits and tracking:
+            self._undo_stack[side].append({'type': 'restore', 'edits': edits})
+        self._refresh()
+
+    def _set_active_side(self, side: str):
+        self._active_side = side
+
+    def _undo(self, side: str):
+        stack = self._undo_stack[side]
+        if not stack:
+            return
+        entry = stack.pop()
+        rows   = self._left_rows   if side == 'left' else self._right_rows
+        source = self._left_source if side == 'left' else self._right_source
+        if entry['type'] == 'restore':
+            for e in reversed(entry['edits']):
+                rows.insert(e.row, e.value)
+                if e.src_idx is not None:
+                    source.insert(e.src_idx, e.value)
+                    self._source_bytes[side] += line_bytes(e.value)
+            self._update_undo_gate(side)
+        else:  # 'remove' — undo of an insert
+            for r in sorted(entry['rows'], reverse=True):
+                if 0 <= r < len(rows):
+                    rows.pop(r)
         self._refresh()
 
     # ── Context menu ──────────────────────────────────────────────────────────
+
+    def _copy_to_clipboard(self, text: str):
+        QApplication.clipboard().setText(text)
 
     def _on_context_menu(self, side: str, row: int, global_pos: QPoint):
         panel = self._left_panel  if side == 'left' else self._right_panel
         sel   = panel.selected_rows
         n_sel = len(sel)
+        is_block = n_sel > 1
 
         menu = QMenu(self)
 
-        # ── Single-row insert / delete ──
-        a_before = menu.addAction(f"Insert blank before row {row + 1}")
-        a_after  = menu.addAction(f"Insert blank after row {row + 1}")
-        a_del = None
-        if row < len(panel.rows) and panel.rows[row][0] is None:
-            a_del = menu.addAction("Delete this blank row")
-
-        # ── Multi-select block ops ──
-        a_del_block        = None
-        a_ins_block_before = None
-        a_ins_block_after  = None
-        if n_sel > 1:
+        # ── Copy / Insert / Delete — same four actions whether the target is
+        # the single clicked row or the whole selected block. ──
+        a_copy = None
+        if is_block:
+            lo, hi = min(sel), max(sel)
+            block_texts = [
+                panel.rows[r][0] for r in sorted(sel)
+                if 0 <= r < len(panel.rows) and panel.rows[r][0] is not None
+            ]
+            if block_texts:
+                a_copy = menu.addAction(f"Copy rows {lo + 1} to {hi + 1}")
             menu.addSeparator()
-            blank_count = sum(
-                1 for r in sel
-                if 0 <= r < len(panel.rows) and panel.rows[r][0] is None
-            )
-            if blank_count > 0:
-                s = 's' if blank_count != 1 else ''
-                a_del_block = menu.addAction(
-                    f"Delete {blank_count} selected blank row{s}")
-            a_ins_block_before = menu.addAction(
-                f"Insert {n_sel} blank rows before selection")
-            a_ins_block_after  = menu.addAction(
-                f"Insert {n_sel} blank rows after selection")
+            a_before = menu.addAction(f"Insert {n_sel} blank rows before row {lo + 1}")
+            a_after  = menu.addAction(f"Insert {n_sel} blank rows after row {hi + 1}")
+            a_del    = menu.addAction(f"Delete rows {lo + 1} to {hi + 1}")
+        else:
+            if row < len(panel.rows) and panel.rows[row][0] is not None:
+                a_copy = menu.addAction(f"Copy row {row + 1}")
+            if a_copy:
+                menu.addSeparator()
+            a_before = menu.addAction(f"Insert blank before row {row + 1}")
+            a_after  = menu.addAction(f"Insert blank after row {row + 1}")
+            a_del = None
+            if row < len(panel.rows):
+                if panel.rows[row][0] is None:
+                    a_del = menu.addAction("Delete this blank row")
+                else:
+                    a_del = menu.addAction(f"Delete row {row + 1}")
 
-        # ── Cross-panel compare / sync ──
+        # ── Cross-panel compare / sync — always on the primary/anchor row ──
         a_compare = None
         a_sync    = None
         ls = self._left_panel.selected
@@ -1294,18 +1475,23 @@ class CompareWindow(QMainWindow):
         if chosen is None:
             return
 
-        if chosen == a_before:
-            self._insert_blank(side, row)
+        if a_copy and chosen == a_copy:
+            if is_block:
+                self._copy_to_clipboard('\n'.join(block_texts))
+            else:
+                self._copy_to_clipboard(panel.rows[row][0])
+        elif chosen == a_before:
+            if is_block:
+                self._insert_n_blanks(side, lo, n_sel)
+            else:
+                self._insert_blank(side, row)
         elif chosen == a_after:
-            self._insert_blank(side, row + 1)
+            if is_block:
+                self._insert_n_blanks(side, hi + 1, n_sel)
+            else:
+                self._insert_blank(side, row + 1)
         elif a_del and chosen == a_del:
-            self._delete_blank(side, row)
-        elif a_del_block and chosen == a_del_block:
-            self._delete_selected_blanks(side)
-        elif a_ins_block_before and chosen == a_ins_block_before:
-            self._insert_n_blanks(side, min(sel), n_sel)
-        elif a_ins_block_after and chosen == a_ins_block_after:
-            self._insert_n_blanks(side, max(sel) + 1, n_sel)
+            self._delete_rows(side, list(sel) if is_block else [row])
         elif a_compare and chosen == a_compare:
             self._compare_selected()
         elif a_sync and chosen == a_sync:
@@ -1407,9 +1593,16 @@ class CompareWindow(QMainWindow):
     # ── Settings / appearance ──────────────────────────────────────────────────
 
     def _apply_appearance(self, a: Appearance):
+        prev = getattr(self, '_appearance', None)
+        limit_changed = prev is None or prev.undo_limit_mb != a.undo_limit_mb
         self._appearance = a
         self._left_panel.apply_appearance(a)
         self._right_panel.apply_appearance(a)
+        if limit_changed:
+            self._update_undo_gate('left')
+            self._update_undo_gate('right')
+            if hasattr(self, '_status_lbl'):
+                self._refresh()   # rebuild the status-bar undo-disabled note
 
     def _open_settings(self):
         original = replace(self._appearance)          # snapshot for Cancel
@@ -1481,12 +1674,17 @@ class CompareWindow(QMainWindow):
         total   = n
         matched = counts['equal']
         pct     = int(100 * matched / total) if total else 0
-        self._status_lbl.setText(
+        status = (
             f"{matched}/{total} rows matched ({pct}%)"
             f"  |  diff: {counts['replace']}"
             f"  |  left-only: {counts['delete']}"
             f"  |  right-only: {counts['insert']}"
         )
+        disabled_sides = [s for s in ('left', 'right') if self._undo_disabled[s]]
+        if disabled_sides:
+            limit = self._appearance.undo_limit_mb
+            status += f"  |  ⚠ undo disabled ({'/'.join(disabled_sides)} > {limit}MB)"
+        self._status_lbl.setText(status)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -1505,6 +1703,7 @@ def main():
 
     app = QApplication(sys.argv[:1] + qt_args)
     app.setStyle("Fusion")
+    app.setWindowIcon(app_icon())
 
     win = CompareWindow(args.left, args.right, sort=args.sort)
     win.show()
