@@ -44,12 +44,12 @@ from PyQt6.QtWidgets import (
     QSplitter, QToolBar, QFileDialog, QScrollArea,
     QSizePolicy, QLabel, QMenu, QMessageBox, QDialog,
     QPlainTextEdit, QDialogButtonBox, QLineEdit, QPushButton, QCheckBox,
-    QTabWidget, QFormLayout, QSpinBox, QFontComboBox,
+    QTabWidget, QFormLayout, QSpinBox, QFontComboBox, QToolTip,
 )
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, QRect, QPoint, QSettings
 from PyQt6.QtGui import (
-    QAction, QColor, QFont, QFontMetrics, QIcon, QImageReader, QKeySequence,
-    QMovie, QPainter, QPixmap,
+    QAction, QColor, QCursor, QFont, QFontMetrics, QIcon, QImageReader,
+    QKeySequence, QMovie, QPainter, QPixmap,
 )
 
 from version import __version__
@@ -148,6 +148,14 @@ PARTIAL_MATCH_BG  = QColor( 80, 200,  80, 170) # green overlay for partial-match
 
 def normalize(text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9]', '', text).lower()
+
+
+def replace_ci(text: str, needle: str, repl: str) -> str:
+    """Replace every case-insensitive, literal occurrence of `needle` in
+    `text` with `repl`."""
+    if not needle:
+        return text
+    return re.sub(re.escape(needle), lambda _m: repl, text, flags=re.IGNORECASE)
 
 
 def make_key_fn(pattern_str: str):
@@ -885,6 +893,59 @@ class SettingsDialog(QDialog):
 
 # ── Main window ───────────────────────────────────────────────────────────────
 
+_FILTER_BTN_STYLE = """
+    QPushButton {
+        padding: 1px 6px; font-size: 10px;
+        border: 1px solid #aaa; border-radius: 3px;
+        background: #e0e0e0; color: #333;
+    }
+    QPushButton:checked {
+        background: #3a9; color: white; border: 1px solid #2a8;
+        font-weight: bold;
+    }
+    QPushButton:disabled {
+        background: #eee; color: #999; border: 1px solid #ccc;
+    }
+"""
+
+_FILTER_BTN_STYLE_NO_GROUPS = """
+    QPushButton {
+        padding: 1px 6px; font-size: 10px;
+        border: 1px solid #c00; border-radius: 3px;
+        background: #f8d0d0; color: #900;
+    }
+    QPushButton:checked {
+        background: #c33; color: white; border: 1px solid #a00;
+        font-weight: bold;
+    }
+    QPushButton:disabled {
+        background: #eee; color: #999; border: 1px solid #ccc;
+    }
+"""
+
+_MODE_BTN_STYLE = """
+    QPushButton {
+        padding: 1px 6px; font-size: 10px;
+        border: 1px solid #aaa; border-radius: 3px;
+        background: #e0e0e0; color: #333;
+    }
+    QPushButton:checked {
+        background: #57c; color: white; border: 1px solid #46b;
+        font-weight: bold;
+    }
+"""
+
+_NAV_BTN_STYLE = """
+    QPushButton {
+        padding: 1px 4px; font-size: 10px;
+        border: 1px solid #aaa; border-radius: 3px;
+        background: #e0e0e0; color: #333;
+    }
+    QPushButton:disabled {
+        background: #eee; color: #999; border: 1px solid #ccc;
+    }
+"""
+
 class CompareWindow(QMainWindow):
 
     def __init__(self, left_path: str | None = None, right_path: str | None = None,
@@ -905,6 +966,7 @@ class CompareWindow(QMainWindow):
         self._undo_stack: dict[str, list[dict]] = {'left': [], 'right': []}
         self._source_bytes:   dict[str, int]  = {'left': 0,     'right': 0}
         self._undo_disabled:  dict[str, bool] = {'left': False, 'right': False}
+        self._find_matches: dict[str, list[int]] = {'left': [], 'right': []}
 
         self._build_ui()
         self._build_toolbar()
@@ -957,9 +1019,9 @@ class CompareWindow(QMainWindow):
         self._right_regex_edit, self._right_filter_btn = self._make_regex_edit('right')
 
         left_container  = self._wrap_panel(
-            self._left_regex_edit,  self._left_filter_btn,  self._left_scroll)
+            self._left_regex_edit,  self._left_filter_btn,  self._left_scroll,  'left')
         right_container = self._wrap_panel(
-            self._right_regex_edit, self._right_filter_btn, self._right_scroll)
+            self._right_regex_edit, self._right_filter_btn, self._right_scroll, 'right')
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(left_container)
@@ -1055,38 +1117,64 @@ class CompareWindow(QMainWindow):
         edit = QLineEdit()
         edit.setPlaceholderText('regex with capture groups, e.g.  " *[0-9]+: *(.*)"')
         edit.setFont(QFont("Courier New", 9))
-        edit.textChanged.connect(lambda: self._on_regex_changed(side, edit))
+        edit.textChanged.connect(lambda: self._on_regex_changed(side, edit, btn))
 
         btn = QPushButton("Filter")
         btn.setCheckable(True)
         btn.setFixedWidth(54)
-        btn.setStyleSheet("""
-            QPushButton {
-                padding: 1px 6px; font-size: 10px;
-                border: 1px solid #aaa; border-radius: 3px;
-                background: #e0e0e0; color: #333;
-            }
-            QPushButton:checked {
-                background: #3a9; color: white; border: 1px solid #2a8;
-                font-weight: bold;
-            }
-        """)
+        btn.setEnabled(False)
+        btn.setProperty("noGroups", False)
+        btn.setStyleSheet(_FILTER_BTN_STYLE)
         btn.toggled.connect(lambda: self._refresh())
+        btn.clicked.connect(lambda: self._on_filter_btn_clicked(btn))
         return edit, btn
 
+    def _on_filter_btn_clicked(self, btn: QPushButton):
+        if btn.property("noGroups"):
+            QToolTip.showText(
+                QCursor.pos(),
+                "A capture group is required in the regex pattern to filter.",
+                btn,
+            )
+
     def _wrap_panel(self, regex_edit: QLineEdit, filter_btn: QPushButton,
-                    scroll: QScrollArea) -> QWidget:
+                    scroll: QScrollArea, side: str) -> QWidget:
         bar = QWidget()
         bar.setFixedHeight(30)
         bar.setStyleSheet("background:#f0f0f8; border-bottom:1px solid #bbb;")
         hl = QHBoxLayout(bar)
         hl.setContentsMargins(6, 2, 6, 2)
         hl.setSpacing(6)
+
+        mode_btn = QPushButton("Find")
+        mode_btn.setCheckable(True)
+        mode_btn.setFixedWidth(40)
+        mode_btn.setStyleSheet(_MODE_BTN_STYLE)
+        mode_btn.setToolTip("Switch between Regex/Filter and Find/Replace")
+
+        regex_row = QWidget()
+        rl = QHBoxLayout(regex_row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(6)
         lbl = QLabel("Regex:")
         lbl.setStyleSheet("font-size:10px; color:#555;")
-        hl.addWidget(lbl)
-        hl.addWidget(regex_edit)
-        hl.addWidget(filter_btn)
+        rl.addWidget(lbl)
+        rl.addWidget(regex_edit, 1)
+        rl.addWidget(filter_btn)
+
+        find_row = self._make_find_controls(side)
+        find_row.setVisible(False)
+
+        hl.addWidget(mode_btn)
+        hl.addWidget(regex_row, 1)
+        hl.addWidget(find_row, 1)
+
+        mode_btn.toggled.connect(
+            lambda checked: self._toggle_find_mode(side, checked, regex_row, find_row))
+
+        setattr(self, f'_{side}_mode_btn', mode_btn)
+        setattr(self, f'_{side}_regex_row', regex_row)
+        setattr(self, f'_{side}_find_row',  find_row)
 
         container = QWidget()
         vl = QVBoxLayout(container)
@@ -1096,19 +1184,99 @@ class CompareWindow(QMainWindow):
         vl.addWidget(scroll, 1)
         return container
 
-    def _on_regex_changed(self, side: str, edit: QLineEdit):
+    def _make_find_controls(self, side: str) -> QWidget:
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(6)
+
+        find_lbl = QLabel("Find:")
+        find_lbl.setStyleSheet("font-size:10px; color:#555;")
+        find_edit = QLineEdit()
+        find_edit.setFont(QFont("Courier New", 9))
+        find_edit.setPlaceholderText("text to find")
+
+        prev_btn = QPushButton("▲")
+        next_btn = QPushButton("▼")
+        for b in (prev_btn, next_btn):
+            b.setFixedWidth(22)
+            b.setStyleSheet(_NAV_BTN_STYLE)
+
+        replace_lbl = QLabel("Replace:")
+        replace_lbl.setStyleSheet("font-size:10px; color:#555;")
+        replace_edit = QLineEdit()
+        replace_edit.setFont(QFont("Courier New", 9))
+        replace_edit.setPlaceholderText("replacement")
+
+        replace_btn     = QPushButton("Replace")
+        replace_all_btn = QPushButton("Replace All")
+        for b in (replace_btn, replace_all_btn):
+            b.setStyleSheet(_NAV_BTN_STYLE)
+
+        hl.addWidget(find_lbl)
+        hl.addWidget(find_edit, 1)
+        hl.addWidget(prev_btn)
+        hl.addWidget(next_btn)
+        hl.addWidget(replace_lbl)
+        hl.addWidget(replace_edit, 1)
+        hl.addWidget(replace_btn)
+        hl.addWidget(replace_all_btn)
+
+        find_edit.textChanged.connect(lambda: self._on_find_text_changed(side))
+        find_edit.returnPressed.connect(lambda: self._find_next(side))
+        prev_btn.clicked.connect(lambda: self._find_prev(side))
+        next_btn.clicked.connect(lambda: self._find_next(side))
+        replace_btn.clicked.connect(lambda: self._replace_current(side))
+        replace_all_btn.clicked.connect(lambda: self._replace_all(side))
+
+        setattr(self, f'_{side}_find_edit',       find_edit)
+        setattr(self, f'_{side}_replace_edit',    replace_edit)
+        setattr(self, f'_{side}_find_prev_btn',   prev_btn)
+        setattr(self, f'_{side}_find_next_btn',   next_btn)
+        setattr(self, f'_{side}_replace_btn',     replace_btn)
+        setattr(self, f'_{side}_replace_all_btn', replace_all_btn)
+        self._update_find_ui_state(side)
+        return row
+
+    def _toggle_find_mode(self, side: str, checked: bool,
+                           regex_row: QWidget, find_row: QWidget):
+        regex_row.setVisible(not checked)
+        find_row.setVisible(checked)
+        if checked:
+            find_edit = getattr(self, f'_{side}_find_edit')
+            find_edit.setFocus()
+            find_edit.selectAll()
+            self._recompute_find_matches(side)
+
+    def _toggle_active_find_mode(self):
+        mode_btn = getattr(self, f'_{self._active_side}_mode_btn')
+        mode_btn.setChecked(not mode_btn.isChecked())
+
+    def _on_regex_changed(self, side: str, edit: QLineEdit, btn: QPushButton):
         txt = edit.text()
         if not txt.strip():
             edit.setStyleSheet("")
+            btn.setEnabled(False)
+            btn.setProperty("noGroups", False)
+            btn.setStyleSheet(_FILTER_BTN_STYLE)
         else:
             try:
                 pat = re.compile(txt)
                 if pat.groups >= 1:
                     edit.setStyleSheet("border: 1px solid #3a3; background:#f0fff0;")
+                    btn.setEnabled(True)
+                    btn.setProperty("noGroups", False)
+                    btn.setStyleSheet(_FILTER_BTN_STYLE)
                 else:
                     edit.setStyleSheet("border: 1px solid #c80; background:#fffbe0;")
+                    btn.setEnabled(True)
+                    btn.setProperty("noGroups", True)
+                    btn.setStyleSheet(_FILTER_BTN_STYLE_NO_GROUPS)
             except re.error:
                 edit.setStyleSheet("border: 1px solid #c00; background:#fff0f0;")
+                btn.setEnabled(False)
+                btn.setProperty("noGroups", False)
+                btn.setStyleSheet(_FILTER_BTN_STYLE)
         self._refresh()
 
     def _get_key_fns(self):
@@ -1121,13 +1289,14 @@ class CompareWindow(QMainWindow):
         tb = self.addToolBar("Tools")
         tb.setMovable(False)
 
-        def act(label: str, tip: str, fn, shortcut: str | None = None):
+        def act(label: str, tip: str, fn, shortcut: str | None = None) -> QAction:
             a = QAction(label, self)
             a.setToolTip(tip)
             a.triggered.connect(fn)
             if shortcut:
                 a.setShortcut(QKeySequence(shortcut))
             tb.addAction(a)
+            return a
 
         # File actions (Open / Paste / Save) live in the per-panel title menus.
         # Keep Open shortcuts available without cluttering the toolbar.
@@ -1144,6 +1313,11 @@ class CompareWindow(QMainWindow):
         undo_sc.setShortcut(QKeySequence.StandardKey.Undo)
         undo_sc.triggered.connect(lambda: self._undo(self._active_side))
         self.addAction(undo_sc)
+
+        find_sc = QAction(self)
+        find_sc.setShortcut(QKeySequence.StandardKey.Find)
+        find_sc.triggered.connect(lambda: self._toggle_active_find_mode())
+        self.addAction(find_sc)
 
         act("Auto-Align", "Align panels using LCS  (Ctrl+A)",    self._auto_align, "Ctrl+A")
         act("Sort",       "Sort both panels' lines  (Ctrl+S)",    self._sort_panels, "Ctrl+S")
@@ -1171,7 +1345,20 @@ class CompareWindow(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
-        act("⚙", "Settings  (Ctrl+,)", self._open_settings, "Ctrl+,")
+
+        # Regular toolbar buttons only use a fraction of the toolbar's row
+        # height for their text. Strip the gear button's padding and grow
+        # its font so the glyph spans the row; the toolbar then naturally
+        # grows to fit it, so it isn't clipped.
+        row_h = tb.sizeHint().height()
+        gear_action = act("⚙", "Settings  (Ctrl+,)", self._open_settings, "Ctrl+,")
+        gear_btn = tb.widgetForAction(gear_action)
+        if gear_btn is not None:
+            gear_btn.setStyleSheet(
+                "QToolButton { padding: 0px; margin: 0px; border: none; }")
+            gear_font = QFont(gear_btn.font())
+            gear_font.setPixelSize(round(row_h * 0.7))
+            gear_btn.setFont(gear_font)
 
     # ── File / text loading ───────────────────────────────────────────────────
 
@@ -1407,10 +1594,146 @@ class CompareWindow(QMainWindow):
                     source.insert(e.src_idx, e.value)
                     self._source_bytes[side] += line_bytes(e.value)
             self._update_undo_gate(side)
+        elif entry['type'] == 'snapshot':
+            # Find/Replace mutates arbitrarily many rows at once, so its undo
+            # is a whole-list snapshot taken before the operation, rather than
+            # an itemized diff like the row insert/delete entries above.
+            if side == 'left':
+                self._left_rows   = entry['rows']
+                self._left_source = entry['source']
+            else:
+                self._right_rows   = entry['rows']
+                self._right_source = entry['source']
+            self._source_bytes[side] = entry['source_bytes']
+            self._update_undo_gate(side)
         else:  # 'remove' — undo of an insert
             for r in sorted(entry['rows'], reverse=True):
                 if 0 <= r < len(rows):
                     rows.pop(r)
+        self._refresh()
+
+    # ── Find & Replace ────────────────────────────────────────────────────────
+
+    def _find_side_rows(self, side: str) -> list:
+        return self._left_rows if side == 'left' else self._right_rows
+
+    def _push_snapshot_undo(self, side: str):
+        if self._undo_disabled[side]:
+            return
+        rows   = self._left_rows   if side == 'left' else self._right_rows
+        source = self._left_source if side == 'left' else self._right_source
+        self._undo_stack[side].append({
+            'type': 'snapshot',
+            'rows': list(rows),
+            'source': list(source),
+            'source_bytes': self._source_bytes[side],
+        })
+
+    def _update_find_ui_state(self, side: str):
+        has = bool(self._find_matches[side])
+        for name in ('_find_prev_btn', '_find_next_btn',
+                     '_replace_btn', '_replace_all_btn'):
+            btn = getattr(self, f'_{side}{name}', None)
+            if btn is not None:
+                btn.setEnabled(has)
+
+    def _recompute_find_matches(self, side: str):
+        find_edit = getattr(self, f'_{side}_find_edit', None)
+        if find_edit is None:
+            return
+        needle = find_edit.text()
+        matches: list[int] = []
+        if needle:
+            needle_l = needle.lower()
+            for i, text in enumerate(self._find_side_rows(side)):
+                if text is not None and needle_l in text.lower():
+                    matches.append(i)
+        self._find_matches[side] = matches
+        self._update_find_ui_state(side)
+
+    def _on_find_text_changed(self, side: str):
+        self._recompute_find_matches(side)
+        self._find_step(side, +1, inclusive=True)
+
+    def _find_step(self, side: str, delta: int, inclusive: bool = False):
+        matches = self._find_matches[side]
+        if not matches:
+            return
+        panel = self._left_panel if side == 'left' else self._right_panel
+        cur = panel.selected
+        if delta > 0:
+            candidates = [m for m in matches if (m >= cur if inclusive else m > cur)] if cur >= 0 else matches
+            target = candidates[0] if candidates else matches[0]
+        else:
+            candidates = [m for m in matches if m < cur] if cur >= 0 else []
+            target = candidates[-1] if candidates else matches[-1]
+        panel.selected = target
+        panel.selected_rows = {target}
+        panel.update()
+        self._scroll_to_row(target)
+
+    def _find_next(self, side: str):
+        self._find_step(side, +1)
+
+    def _find_prev(self, side: str):
+        self._find_step(side, -1)
+
+    def _replace_current(self, side: str):
+        matches = self._find_matches[side]
+        if not matches:
+            return
+        find_edit    = getattr(self, f'_{side}_find_edit')
+        replace_edit = getattr(self, f'_{side}_replace_edit')
+        needle = find_edit.text()
+        if not needle:
+            return
+        panel = self._left_panel if side == 'left' else self._right_panel
+        row = panel.selected if panel.selected in matches else matches[0]
+
+        self._push_snapshot_undo(side)
+        rows   = self._find_side_rows(side)
+        source = self._left_source if side == 'left' else self._right_source
+        text = rows[row]
+        new_text = replace_ci(text, needle, replace_edit.text())
+        rows[row] = new_text
+        src_idx = sum(1 for x in rows[:row] if x is not None)
+        if 0 <= src_idx < len(source):
+            self._source_bytes[side] += line_bytes(new_text) - line_bytes(source[src_idx])
+            source[src_idx] = new_text
+        self._update_undo_gate(side)
+
+        self._refresh()
+        self._find_step(side, +1, inclusive=True)
+
+    def _replace_all(self, side: str):
+        matches = self._find_matches[side]
+        if not matches:
+            return
+        find_edit    = getattr(self, f'_{side}_find_edit')
+        replace_edit = getattr(self, f'_{side}_replace_edit')
+        needle = find_edit.text()
+        if not needle:
+            return
+        repl = replace_edit.text()
+
+        self._push_snapshot_undo(side)
+        rows   = self._find_side_rows(side)
+        source = self._left_source if side == 'left' else self._right_source
+        changed = False
+        for row in matches:
+            text = rows[row]
+            new_text = replace_ci(text, needle, repl)
+            if new_text == text:
+                continue
+            rows[row] = new_text
+            src_idx = sum(1 for x in rows[:row] if x is not None)
+            if 0 <= src_idx < len(source):
+                self._source_bytes[side] += line_bytes(new_text) - line_bytes(source[src_idx])
+                source[src_idx] = new_text
+            changed = True
+        if changed:
+            self._update_undo_gate(side)
+
         self._refresh()
 
     # ── Context menu ──────────────────────────────────────────────────────────
@@ -1684,6 +2007,13 @@ class CompareWindow(QMainWindow):
         if disabled_sides:
             limit = self._appearance.undo_limit_mb
             status += f"  |  ⚠ undo disabled ({'/'.join(disabled_sides)} > {limit}MB)"
+
+        # Any operation that can reshape _left_rows/_right_rows (undo, sort,
+        # auto-align, blank insert/delete, ...) funnels through _refresh, so
+        # recomputing matches here keeps them from drifting out of sync with
+        # whatever row indices they're supposed to point at.
+        self._recompute_find_matches('left')
+        self._recompute_find_matches('right')
         self._status_lbl.setText(status)
 
 
