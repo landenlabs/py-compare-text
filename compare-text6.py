@@ -36,6 +36,7 @@ if sys.platform == "win32":
 
 import argparse
 import difflib
+import subprocess
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -46,10 +47,10 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit, QDialogButtonBox, QLineEdit, QPushButton, QCheckBox,
     QTabWidget, QFormLayout, QSpinBox, QFontComboBox, QToolTip,
 )
-from PyQt6.QtCore import Qt, QSize, pyqtSignal, QRect, QPoint, QSettings
+from PyQt6.QtCore import Qt, QSize, pyqtSignal, QRect, QPoint, QSettings, QUrl
 from PyQt6.QtGui import (
-    QAction, QColor, QCursor, QFont, QFontMetrics, QIcon, QImageReader,
-    QKeySequence, QMovie, QPainter, QPixmap,
+    QAction, QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon,
+    QImageReader, QKeySequence, QMovie, QPainter, QPixmap,
 )
 
 from version import __version__
@@ -899,10 +900,6 @@ _FILTER_BTN_STYLE = """
         border: 1px solid #aaa; border-radius: 3px;
         background: #e0e0e0; color: #333;
     }
-    QPushButton:checked {
-        background: #3a9; color: white; border: 1px solid #2a8;
-        font-weight: bold;
-    }
     QPushButton:disabled {
         background: #eee; color: #999; border: 1px solid #ccc;
     }
@@ -913,10 +910,6 @@ _FILTER_BTN_STYLE_NO_GROUPS = """
         padding: 1px 6px; font-size: 10px;
         border: 1px solid #c00; border-radius: 3px;
         background: #f8d0d0; color: #900;
-    }
-    QPushButton:checked {
-        background: #c33; color: white; border: 1px solid #a00;
-        font-weight: bold;
     }
     QPushButton:disabled {
         background: #eee; color: #999; border: 1px solid #ccc;
@@ -951,7 +944,7 @@ class CompareWindow(QMainWindow):
     def __init__(self, left_path: str | None = None, right_path: str | None = None,
                  sort: bool = False):
         super().__init__()
-        self.setWindowTitle("Side-by-Side Comparison")
+        self.setWindowTitle(f"Side-by-Side Comparison - v{__version__} - LanDen Labs 2026")
         self.setWindowIcon(app_icon())
         self.resize(1400, 900)
 
@@ -1120,22 +1113,65 @@ class CompareWindow(QMainWindow):
         edit.textChanged.connect(lambda: self._on_regex_changed(side, edit, btn))
 
         btn = QPushButton("Filter")
-        btn.setCheckable(True)
         btn.setFixedWidth(54)
         btn.setEnabled(False)
         btn.setProperty("noGroups", False)
         btn.setStyleSheet(_FILTER_BTN_STYLE)
-        btn.toggled.connect(lambda: self._refresh())
-        btn.clicked.connect(lambda: self._on_filter_btn_clicked(btn))
+        btn.setToolTip(
+            "Replace each matching row's text with its captured group(s), "
+            "in place. Ctrl+Z to undo — apply again to filter further.")
+        btn.clicked.connect(lambda: self._on_filter_btn_clicked(side, edit, btn))
         return edit, btn
 
-    def _on_filter_btn_clicked(self, btn: QPushButton):
+    def _on_filter_btn_clicked(self, side: str, edit: QLineEdit, btn: QPushButton):
         if btn.property("noGroups"):
             QToolTip.showText(
                 QCursor.pos(),
                 "A capture group is required in the regex pattern to filter.",
                 btn,
             )
+            return
+        self._apply_filter(side, edit)
+
+    def _apply_filter(self, side: str, edit: QLineEdit):
+        """Destructively extract each matching row's capture group(s) into
+        the row itself (rows and source stay in sync), so a later filter
+        can build on top of an earlier one. Undo (Ctrl+Z) reverts the whole
+        side via the same row/source snapshot used by Find & Replace."""
+        pattern_str = edit.text()
+        try:
+            pat = re.compile(pattern_str)
+        except re.error:
+            return
+        if pat.groups < 1:
+            return
+
+        rows = self._left_rows if side == 'left' else self._right_rows
+        extracted: dict[int, str] = {}
+        for i, text in enumerate(rows):
+            if text is None:
+                continue
+            m = pat.match(text)
+            if not m:
+                continue
+            new_text = ''.join(g for g in m.groups() if g is not None)
+            if new_text != text:
+                extracted[i] = new_text
+        if not extracted:
+            return
+
+        self._push_snapshot_undo(side)
+        source = self._left_source if side == 'left' else self._right_source
+        for i, new_text in extracted.items():
+            rows[i] = new_text
+            src_idx = sum(1 for x in rows[:i] if x is not None)
+            if 0 <= src_idx < len(source):
+                self._source_bytes[side] += line_bytes(new_text) - line_bytes(source[src_idx])
+                source[src_idx] = new_text
+        self._update_undo_gate(side)
+
+        edit.clear()
+        self._refresh()
 
     def _wrap_panel(self, regex_edit: QLineEdit, filter_btn: QPushButton,
                     scroll: QScrollArea, side: str) -> QWidget:
@@ -1370,6 +1406,9 @@ class CompareWindow(QMainWindow):
         a_save  = menu.addAction("Save As…")
         src = self._left_source if side == 'left' else self._right_source
         a_save.setEnabled(bool(src))
+        menu.addSeparator()
+        a_locate = menu.addAction("Open File Location")
+        a_locate.setEnabled(bool(self._paths[side]))
         chosen = menu.exec(global_pos)
         if chosen == a_open:
             self._browse(side)
@@ -1377,6 +1416,19 @@ class CompareWindow(QMainWindow):
             self._paste(side)
         elif chosen == a_save:
             self._save(side)
+        elif chosen == a_locate:
+            self._open_file_location(side)
+
+    def _open_file_location(self, side: str):
+        path = self._paths[side]
+        if not path:
+            return
+        if sys.platform == 'darwin':
+            subprocess.run(['open', '-R', path])
+        elif sys.platform.startswith('win'):
+            subprocess.run(['explorer', '/select,', path])
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
 
     def _save(self, side: str):
         rows = self._left_rows if side == 'left' else self._right_rows
@@ -1972,24 +2024,20 @@ class CompareWindow(QMainWindow):
         counts = {k: 0 for k in BG}
 
         lk, rk = self._get_key_fns()
-        l_filter      = self._left_filter_btn.isChecked()  and lk is not None
-        r_filter      = self._right_filter_btn.isChecked() and rk is not None
-        partial_mode  = self._partial_match_cb.isChecked()
+        partial_mode = self._partial_match_cb.isChecked()
 
         for i in range(n):
             lt = l[i] if i < len(l) else None
             rt = r[i] if i < len(r) else None
             s  = row_status(lt, rt, lk, rk)
             counts[s] = counts.get(s, 0) + 1
-            lt_d = lk(lt) if l_filter and lt is not None else lt
-            rt_d = rk(rt) if r_filter and rt is not None else rt
-            if partial_mode and s == 'replace' and lt_d is not None and rt_d is not None:
-                l_spans, r_spans = find_partial_matches(lt_d, rt_d)
-                ld.append((lt_d, s, None, l_spans if l_spans else None))
-                rd.append((rt_d, s, None, r_spans if r_spans else None))
+            if partial_mode and s == 'replace' and lt is not None and rt is not None:
+                l_spans, r_spans = find_partial_matches(lt, rt)
+                ld.append((lt, s, None, l_spans if l_spans else None))
+                rd.append((rt, s, None, r_spans if r_spans else None))
             else:
-                ld.append((lt_d, s))
-                rd.append((rt_d, s))
+                ld.append((lt, s))
+                rd.append((rt, s))
 
         self._left_panel.set_rows(ld)
         self._right_panel.set_rows(rd)

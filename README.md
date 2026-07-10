@@ -27,7 +27,33 @@ word-level diff highlighting, and synchronized scrolling.
 
 ## Screenshots
 
-_(coming soon)_
+### Side-by-side text viewer
+
+Synchronize two files by adding or removing rows, with color-coded rows showing
+matches, differences, and left/right-only lines.
+
+<img src="screens/main.png" width="800" alt="Side-by-side text viewer">
+
+### Partial-match highlighting
+
+A visual aid that highlights the common substrings (≥ 3 chars) shared between
+differing rows, making small changes easy to spot at a glance.
+
+<img src="screens/partial-match.png" width="800" alt="Partial-match highlighting">
+
+### Regex capture-group noise removal
+
+Type a regex with a capture group above a panel and click **Filter** to strip
+timestamp/log noise from every row in place — leaving just the content that
+matters for comparison.
+
+**Before** — noisy rows fail to match:
+
+<img src="screens/regex-before.png" width="800" alt="Before applying a regex filter">
+
+**After** — filtered rows line up:
+
+<img src="screens/regex-after.png" width="800" alt="After applying a regex filter">
 
 ---
 
