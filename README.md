@@ -1,7 +1,7 @@
 <table border="0">
   <tr>
     <td>
-      <!-- VERSION -->v6.07.05<br>
+      <!-- VERSION -->v6.07.06<br>
       <!-- DATE -->09-Jul-2026<br>
       macOS &nbsp;|&nbsp; Windows &nbsp;|&nbsp; Linux<br>
       <a href="https://landenlabs.com">Home</a>
@@ -237,7 +237,7 @@ the repo root:
 ./set-version.bash -version 1.0.1 -message "Fix LCS alignment on tab-only lines"
 ```
 
-This updates `VERSION`, `version.py` (`__version__`), and the `<!-- VERSION -->v6.07.05 /
+This updates `VERSION`, `version.py` (`__version__`), and the `<!-- VERSION -->v6.07.06 /
 `<!-- DATE -->09-Jul-2026
 pushed `vX.Y.Z` tag triggers the release build above. The in-app "Built" date (Settings ▸
 About) is derived from `version.py`'s file timestamp, so it tracks the last version bump.
