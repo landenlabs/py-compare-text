@@ -55,6 +55,19 @@ matters for comparison.
 
 <img src="screens/regex-after.png" width="800" alt="After applying a regex filter">
 
+<p><hr>
+
+**File Menu**
+
+<img src="screens/file-menu.png" width="800" alt="File menu">
+
+<p><hr>
+
+**Settings**
+
+<img src="screens/settings-appearance.png" width="400" alt="Settings appearance">
+<img src="screens/settings-about.png" width="400" alt="Settings about">
+
 ---
 
 ## Features
