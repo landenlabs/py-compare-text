@@ -11,6 +11,7 @@
         README.md                   <!-- VERSION -->vX.Y.Z  and  <!-- DATE -->dd-MMM-yyyy
         *.csproj                    <Version>X.Y.Z</Version>
         version.py / __init__.py    __version__ = "X.Y.Z"
+        *.py (standalone scripts)   VERSION = "vX.Y.Z"  (hardcoded literal, no import)
         *version_info*.py           filevers/prodvers tuples + FileVersion/ProductVersion
         *.cpp / *.h / ...           #define VERSION / _VERSION "vX.Y.Z"
         *.rc                        FILEVERSION/PRODUCTVERSION + strings + (C) year
@@ -241,6 +242,21 @@ foreach ($f in Get-RepoFiles @('version.py', '_version.py', '__init__.py')) {
             $t = [regex]::Replace($t, "(__version__\s*=\s*')[^']*(')", "`${1}$ver`${2}")
             $t
         } "$($f.Name)  (__version__ = $ver)"
+    }
+}
+
+# ── 4b. Python: standalone-script literal  VERSION = "vX.Y.Z"  ──────────────
+# Some scripts are distributed as a single file (no sibling version.py), so
+# they hardcode VERSION instead of importing __version__.
+foreach ($f in Get-RepoFiles '*.py') {
+    $text = (Read-Utf8 $f.FullName).Text
+    if ($text -match '(?m)^\s*VERSION\s*=\s*["'']v?[0-9]') {
+        Edit-Utf8 $f.FullName {
+            param($t)
+            $t = [regex]::Replace($t, '(VERSION\s*=\s*")v?[^"]*(")', "`${1}$tag`${2}")
+            $t = [regex]::Replace($t, "(VERSION\s*=\s*')v?[^']*(')", "`${1}$tag`${2}")
+            $t
+        } "$($f.Name)  (VERSION = ""$tag"")"
     }
 }
 

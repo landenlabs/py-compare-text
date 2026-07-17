@@ -12,6 +12,7 @@
 #     README.md                   <!-- VERSION -->vX.Y.Z  and  <!-- DATE -->dd-MMM-yyyy
 #     *.csproj                    <Version>X.Y.Z</Version>
 #     version.py / __init__.py    __version__ = "X.Y.Z"
+#     *.py (standalone scripts)   VERSION = "vX.Y.Z"  (hardcoded literal, no import)
 #     *version_info*.py           filevers/prodvers tuples + FileVersion/ProductVersion
 #     *.cpp / *.h / ...           #define VERSION / _VERSION "vX.Y.Z"
 #     *.rc                        FILEVERSION/PRODUCTVERSION + strings + (C) year
@@ -163,6 +164,16 @@ while IFS= read -r f; do
         add_changed "$f"; echo "Updated : $f  (__version__ = $VER)"
     fi
 done < <(find . "${PRUNE[@]}" -o -type f \( -name version.py -o -name _version.py -o -name __init__.py \) -print)
+
+# ── 4b. Python: standalone-script literal  VERSION = "vX.Y.Z"  ──────────────
+# Some scripts are distributed as a single file (no sibling version.py), so
+# they hardcode VERSION instead of importing __version__.
+while IFS= read -r f; do
+    if grep -qE '^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*["'"'"']v?[0-9]' "$f"; then
+        perl -0pi -e "s/(VERSION\s*=\s*[\"'])v?[^\"']*([\"'])/\${1}$TAG\${2}/g" "$f"
+        add_changed "$f"; echo "Updated : $f  (VERSION = \"$TAG\")"
+    fi
+done < <(find . "${PRUNE[@]}" -o -type f -name '*.py' -print)
 
 # ── 5. PyInstaller: *version_info*.py tuples + version strings ───────────────
 while IFS= read -r f; do
